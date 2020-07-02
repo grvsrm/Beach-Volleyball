@@ -1,0 +1,300 @@
+---
+title: "A XGBoost Classification Model on Beach Volleyball"
+author: "Gaurav Sharma"
+date: "01/07/2020"
+output: github_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, dpi = 180, fig.width = 8, fig.height = 5, warning = F, message = F)
+library(tidyverse)
+library(tidymodels)
+#load(file = "allobjects.RData")
+```
+
+### Let's load the dataset
+```{r}
+vb_matches <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-19/vb_matches.csv', guess_max = 76000)
+
+vb_matches %>% 
+    head() %>% 
+    knitr::kable()
+
+```
+
+### Let's explore the dataset
+
+```{r}
+skimr::skim(vb_matches)
+```
+
+We will dataexplorer package to explore the data further
+```{r}
+
+DataExplorer::plot_str(vb_matches)
+DataExplorer::plot_intro(vb_matches)
+DataExplorer::plot_missing(vb_matches)
+
+```
+
+# Prepare data
+```{r}
+vb_parsed <- vb_matches %>%
+    transmute(
+        circuit,
+        gender,
+        year,
+        w_attacks = w_p1_tot_attacks + w_p2_tot_attacks,
+        w_kills = w_p1_tot_kills + w_p2_tot_kills,
+        w_errors = w_p1_tot_errors + w_p2_tot_errors,
+        w_aces = w_p1_tot_aces + w_p2_tot_aces,
+        w_serve_errors = w_p1_tot_serve_errors + w_p2_tot_serve_errors,
+        w_blocks = w_p1_tot_blocks + w_p2_tot_blocks,
+        w_digs = w_p1_tot_digs + w_p2_tot_digs,
+        l_attacks = l_p1_tot_attacks + l_p2_tot_attacks,
+        l_kills = l_p1_tot_kills + l_p2_tot_kills,
+        l_errors = l_p1_tot_errors + l_p2_tot_errors,
+        l_aces = l_p1_tot_aces + l_p2_tot_aces,
+        l_serve_errors = l_p1_tot_serve_errors + l_p2_tot_serve_errors,
+        l_blocks = l_p1_tot_blocks + l_p2_tot_blocks,
+        l_digs = l_p1_tot_digs + l_p2_tot_digs
+    ) %>%
+    na.omit()
+
+winners <- vb_parsed %>% 
+    select(circuit,
+           gender,
+           year,
+           w_attacks:w_digs) %>% 
+    rename_with(~str_remove_all(., "w_")) %>% 
+    mutate(win = "win")
+
+losers <- vb_parsed %>% 
+    select(circuit,
+           gender,
+           year,
+           l_attacks:l_digs) %>% 
+    rename_with(~str_remove_all(., "l_")) %>% 
+    mutate(win = "lose")
+
+vb_df <- bind_rows(winners, losers) %>% 
+    mutate_if(is.character, factor)
+
+vb_df %>% 
+    head() %>% 
+    knitr::kable()
+
+```
+
+# Some EDA
+```{r}
+vb_df %>%
+  pivot_longer(attacks:digs, names_to = "stat", values_to = "value") %>%
+  ggplot(aes(
+    x = gender,
+    y = value,
+    fill = win,
+    color = win
+  )) +
+  geom_boxplot(alpha = 0.5) +
+  facet_wrap( ~ stat, scales = "free_y", nrow = 2) +
+  labs(x = NULL,
+       fill = NULL,
+       color = NULL)
+  
+```
+
+```{r}
+vb_df %>%
+  pivot_longer(attacks:digs, names_to = "stat", values_to = "value") %>%
+  ggplot(aes(
+    x = circuit,
+    y = value,
+    fill = win,
+    color = win
+  )) +
+  geom_boxplot(alpha = 0.5) +
+  facet_wrap( ~ stat, scales = "free_y", nrow = 2) +
+  labs(x = NULL,
+       fill = NULL,
+       color = NULL)
+```
+
+### Build a model
+```{r}
+set.seed(123)
+vb_split <- vb_df %>% 
+  initial_split(strata = win)
+
+vb_train <- training(vb_split)
+vb_test <- testing(vb_split)
+vb_split
+
+```
+
+```{r}
+
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine(engine = "xgboost") %>%
+  set_mode(mode = "classification")
+
+xgb_spec
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(tree_depth(),
+                     min_n(),
+                     loss_reduction(),
+                     sample_size = sample_prop(),
+                     finalize(mtry(),vb_train),
+                     learn_rate(),
+                     size = 20)
+xgb_grid
+```
+
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_formula(win ~ .) %>%
+  add_model(xgb_spec)
+xgb_wf
+```
+
+```{r}
+set.seed(123)
+vb_folds <- vfold_cv(vb_train, strata = win)
+vb_folds
+```
+
+
+```{r}
+doParallel::registerDoParallel()
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = vb_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = T, verbose = T)
+)
+
+```
+
+### Explore the results
+
+```{r}
+best_auc <- xgb_res %>% 
+  show_best(metric = "roc_auc")
+best_auc
+```
+
+```{r}
+best_acc <- xgb_res %>% 
+  show_best(metric = "accuracy")
+best_acc
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               names_to = "parameter",
+               values_to = "value") %>%
+  ggplot(aes(value, mean, color = parameter), alpha = 0.5) +
+  geom_line(size = 1, show.legend = F) +
+  facet_wrap( ~ parameter, scales = "free_x") 
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  transmute(trial = row_number(), .metric, mean) %>%
+  ggplot(aes(trial, mean, color = .metric), alpha = 0.5) +
+  geom_line(size = 1, show.legend = T) +
+  geom_point(size = 2, show.legend = T) +
+  labs(x = "Trials",
+       y = "Mean Parametric Value",
+       title = "Accuracy & AUC trends for different trials")  
+```
+
+# Let's select the best hyperparameter based on best roc_auc
+```{r}
+best_auc <- xgb_res %>% 
+  select_best(metric = "roc_auc")
+
+final_xgb <- xgb_wf %>% 
+  finalize_workflow(best_auc)
+
+final_xgb
+```
+
+
+```{r}
+library(vip)
+
+final_xgb %>% 
+  fit(data = vb_train) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom = "point")
+
+```
+
+```{r}
+final_res <- final_xgb %>% 
+  last_fit(vb_split)
+
+final_metric <- final_res %>%
+  collect_metrics()
+
+final_metric    
+```
+
+```{r}
+final_conf_mat <- final_res %>% 
+  collect_predictions() %>% 
+  conf_mat(win, .pred_class)
+
+final_conf_mat
+```
+
+```{r}
+final_res %>% 
+  collect_predictions() %>% 
+  roc_curve(win, .pred_win) %>% 
+  autoplot()
+```
+
+# Lets save our data and objects
+```{r}
+save.image(file = "allobjects.RData")
+
+```
+
+Finish
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
