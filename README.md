@@ -1,3 +1,3 @@
 # Beach-Volleyball
 
-A classification model using xgboosta algorithm to predict wins on Beach Volleyball Data
+A classification model using xgboost algorithm to predict wins on Beach Volleyball Data
